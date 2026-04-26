@@ -162,6 +162,23 @@ app.post('/discord/sync', async (req, res) => {
   res.json(result);
 });
 
+// Endpoint: Kirim pengumuman ke channel Discord
+app.post('/discord/announce', async (req, res) => {
+  const { channel_id, message } = req.body;
+  if (!channel_id || !message) {
+    return res.status(400).json({ error: 'channel_id dan message wajib diisi' });
+  }
+  try {
+    const channel = await client.channels.fetch(channel_id);
+    if (!channel) return res.status(404).json({ error: 'Channel tidak ditemukan' });
+    await channel.send(message);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Announce error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Health check
 app.get('/', (req, res) => res.json({ status: 'MenolakRugi Bot is running!' }));
 
