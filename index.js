@@ -182,5 +182,62 @@ app.post('/discord/announce', async (req, res) => {
 // Health check
 app.get('/', (req, res) => res.json({ status: 'MenolakRugi Bot is running!' }));
 
+// ─── Session Scheduler ───────────────────────────────────────────────
+const SESSION_CHANNEL = '1390897671874674728';
+
+const SESSION_MESSAGES = {
+  // Format: 'HH:MM' dalam WITA (UTC+8)
+  '07:00': {
+    msg: `🌸 **SESSION TOKYO DIBUKA**\n\nSesi Asia resmi dimulai! Likuiditas mulai meningkat.\n\n📊 Pair yang aktif: **USD/JPY, EUR/JPY, GBP/JPY**\n\n> Perhatikan level-level penting dari sesi sebelumnya. Setup IDM dan OB sering terbentuk di sini! 🎯`,
+  },
+  '16:00': {
+    msg: `🌸 **SESSION TOKYO DITUTUP**\n\nSesi Tokyo telah berakhir. Bersiap menyambut sesi London!\n\n> Evaluasi setup yang sudah terbentuk dan tunggu konfirmasi dari London. 📈`,
+  },
+  '15:00': {
+    msg: `🇬🇧 **SESSION LONDON DIBUKA** — ⚡ OVERLAP TOKYO + LONDON!\n\nINI WAKTU EMAS! Dua sesi besar bertemu — volatilitas dan likuiditas sedang tinggi-tingginya.\n\n📊 Pair paling aktif: **GBP/USD, EUR/USD, GBP/JPY, EUR/JPY**\n\n> Sesi overlap = banyak likuiditas yang disapu. IDM, BOS, dan OB sering terjadi di sini. Siapkan setup terbaikmu! 🔥`,
+  },
+  '00:00': {
+    msg: `🇬🇧 **SESSION LONDON DITUTUP**\n\nSesi London telah berakhir. New York masih berjalan hingga pukul 05:00 WITA.\n\n> Jika belum ada setup valid, lebih baik istirahat. Jangan trading karena bosan! 😴`,
+  },
+  '20:00': {
+    msg: `🗽 **SESSION NEW YORK DIBUKA** — ⚡ OVERLAP LONDON + NEW YORK!\n\nOVERLAP TERBESAR DAN TERPENTING HARI INI! Ini adalah sesi dengan volume trading tertinggi.\n\n📊 Pair paling aktif: **EUR/USD, GBP/USD, USD/JPY, XAU/USD**\n\n> Mayoritas pergerakan besar terjadi di sini. Setup yang sudah terbentuk sejak London sering ter-trigger sekarang. FOKUS dan DISIPLIN! 🚀🔥`,
+  },
+  '05:01': {
+    msg: `🔴 **SESSION NEW YORK DITUTUP — MARKET SELESAI HARI INI**\n\nSemua sesi utama telah berakhir. Waktunya evaluasi dan istirahat.\n\n📝 Jangan lupa isi jurnal trading hari ini!\n\n> Konsistensi journaling = kunci berkembang lebih cepat. Sampai besok, Sobat Trader! 💪`,
+  },
+};
+
+function getWITATime() {
+  const now = new Date();
+  // UTC+8
+  const wita = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  const hh = String(wita.getUTCHours()).padStart(2, '0');
+  const mm = String(wita.getUTCMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+async function sendSessionMessage(msg) {
+  try {
+    const channel = await client.channels.fetch(SESSION_CHANNEL);
+    if (channel) await channel.send(msg);
+  } catch (err) {
+    console.error('Session msg error:', err.message);
+  }
+}
+
+// Cek setiap menit
+let lastSent = '';
+setInterval(async () => {
+  const time = getWITATime();
+  if (SESSION_MESSAGES[time] && lastSent !== time) {
+    lastSent = time;
+    await sendSessionMessage(SESSION_MESSAGES[time].msg);
+    console.log(`Session message sent: ${time}`);
+  }
+}, 60 * 1000);
+
+console.log('Session scheduler aktif (WITA/UTC+8)');
+// ─────────────────────────────────────────────────────────────────────
+
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
