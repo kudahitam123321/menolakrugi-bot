@@ -41,6 +41,34 @@ client.once('ready', () => {
 
 client.login(BOT_TOKEN);
 
+// Helper: format nickname Discord
+function formatNickname(namaLengkap) {
+  const kata = namaLengkap.trim().split(/\s+/);
+  const muhamadVariants = ['muhammad', 'muhamad', 'mohammad', 'mohamad', 'muhammah'];
+  let namaPanggil = kata[0];
+  if (muhamadVariants.includes(kata[0].toLowerCase()) && kata.length > 1) {
+    namaPanggil = kata[1];
+  }
+  // Capitalize huruf pertama
+  namaPanggil = namaPanggil.charAt(0).toUpperCase() + namaPanggil.slice(1).toLowerCase();
+  return `[✅] ${namaPanggil}_ᴾᵀᴹᴿ`;
+}
+
+// Helper: set nickname member di Discord
+async function setMemberNickname(discordUserId, namaLengkap) {
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const member = await guild.members.fetch(discordUserId);
+    const nickname = formatNickname(namaLengkap);
+    await member.setNickname(nickname);
+    console.log(`Nickname set: ${nickname}`);
+    return { success: true, nickname };
+  } catch (err) {
+    console.error('Error set nickname:', err.message);
+    return { success: false, error: err.message };
+  }
+}
+
 // Helper: set roles untuk member
 async function setMemberRoles(discordUserId, tier, isAdvance) {
   try {
@@ -142,6 +170,9 @@ app.get('/discord/callback', async (req, res) => {
     // Set roles
     const result = await setMemberRoles(discordUser.id, member.tier, member.is_advance);
 
+    // Auto set nickname
+    await setMemberNickname(discordUser.id, member.nama);
+
     if (result.success) {
       res.json({ success: true, discord_username: discordUser.username, tier: member.tier });
     } else {
@@ -159,6 +190,17 @@ app.post('/discord/sync', async (req, res) => {
   const { data: member } = await supabase.from('members').select('*').eq('id', member_id).single();
   if (!member || !member.discord_id) return res.status(404).json({ error: 'Member not found or Discord not connected' });
   const result = await setMemberRoles(member.discord_id, member.tier, member.is_advance);
+  // Sync nickname juga
+  await setMemberNickname(member.discord_id, member.nama);
+  res.json(result);
+});
+
+// Endpoint: Set nickname manual
+app.post('/discord/nickname', async (req, res) => {
+  const { member_id } = req.body;
+  const { data: member } = await supabase.from('members').select('*').eq('id', member_id).single();
+  if (!member || !member.discord_id) return res.status(404).json({ error: 'Member tidak ditemukan atau Discord belum terhubung' });
+  const result = await setMemberNickname(member.discord_id, member.nama);
   res.json(result);
 });
 
