@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
 import { createClient } from '@supabase/supabase-js';
 
 const app = express();
@@ -62,8 +62,236 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
-client.once('ready', () => {
+client.once('ready', async () => {
   console.log(`Bot ready: ${client.user.tag}`);
+
+  // Register slash command /sync-nickname
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('sync-nickname')
+      .setDescription('Update semua nickname member berdasarkan role Discord mereka')
+      .toJSON(),
+  ];
+
+  const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
+  try {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    console.log('Slash command /sync-nickname registered');
+  } catch (err) {
+    console.error('Gagal register slash command:', err.message);
+  }
+});
+
+// Handler slash command /sync-nickname
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== 'sync-nickname') return;
+
+  // Hanya owner server atau admin yang bisa jalankan
+  const member = interaction.member;
+  const isAdmin = member.permissions.has('Administrator');
+  const isOwner = interaction.guild.ownerId === interaction.user.id;
+
+  if (!isAdmin && !isOwner) {
+    return interaction.reply({ content: '❌ Kamu tidak punya izin menjalankan perintah ini.', ephemeral: true });
+  }
+
+  await interaction.reply({ content: '⏳ Memperbarui nickname semua member... Harap tunggu.', ephemeral: true });
+
+  try {
+    const guild = interaction.guild;
+    const allMembers = await guild.members.fetch();
+
+    let updated = 0;
+    let skipped = 0;
+    let errors = 0;
+
+    for (const [, guildMember] of allMembers) {
+      if (guildMember.user.bot) continue;
+
+      const memberRoleIds = guildMember.roles.cache.map(r => r.id);
+
+      // Cek punya tier role
+      const tierEntry = Object.entries(ROLES).find(([key, roleId]) =>
+        !['Basic', 'Advanced'].includes(key) && memberRoleIds.includes(roleId)
+      );
+      if (!tierEntry) { skipped++; continue; }
+
+      const detectedTier = tierEntry[0];
+      const fundedEntry = Object.entries(FUNDED_ROLES).find(([, roleId]) =>
+        memberRoleIds.includes(roleId)
+      );
+      const detectedFunded = fundedEntry ? fundedEntry[0] : null;
+
+      // Coba cari nama di database
+      const { data: dbMember } = await supabase
+        .from('members')
+        .select('nama')
+        .eq('discord_id', guildMember.id)
+        .single();
+
+      const nama = dbMember?.nama
+        || extractNameFromNickname(guildMember.nickname)
+        || guildMember.user.displayName
+        || guildMember.user.username;
+
+      const nickname = formatNickname(nama, detectedTier, detectedFunded);
+
+      try {
+        await guildMember.setNickname(nickname);
+        updated++;
+        await new Promise(r => setTimeout(r, 500)); // delay biar tidak kena rate limit
+      } catch {
+        errors++;
+      }
+    }
+
+    await interaction.editReply(
+      `✅ **Sync selesai!**\n` +
+      `📝 Diupdate: **${updated}** member\n` +
+      `⏭️ Dilewati (tanpa role): **${skipped}** member\n` +
+      `❌ Gagal: **${errors}** member`
+    );
+  } catch (err) {
+    console.error('sync-nickname command error:', err.message);
+    await interaction.editReply('❌ Terjadi error saat sync. Cek log bot.');
+  }
+});
+
+// Helper: ekstrak nama dari nickname Discord yang sudah ada
+// Contoh: "[✅] Erckxml_ᴾᵀᴹᴿ" → "Erckxml"
+// Contoh: "[🥇]Ahmad_ᴾᵀᴹᴿ·P1" → "Ahmad"
+function extractNameFromNickname(nickname) {
+  if (!nickname) return null;
+  // Hapus prefix [emoji] atau [✅] dll
+  let name = nickname.replace(/^\[.*?\]\s*/, '');
+  // Hapus suffix _ᴾᵀᴹᴿ dan apapun setelahnya
+  name = name.split('_ᴾᵀᴹᴿ')[0];
+  return name.trim() || null;
+}
+
+// Event: otomatis update nickname ketika role member berubah manual di Discord
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+  try {
+    // Cek apakah ada perubahan role yang relevan
+    const oldRoleIds = oldMember.roles.cache.map(r => r.id);
+    const newRoleIds = newMember.roles.cache.map(r => r.id);
+
+    const allManagedIds = [
+      ...Object.values(ROLES),
+      ...Object.values(FUNDED_ROLES),
+    ];
+
+    const roleChanged =
+      allManagedIds.some(id => oldRoleIds.includes(id) !== newRoleIds.includes(id));
+
+    if (!roleChanged) return;
+
+    // Deteksi tier dari role aktif
+    const tierEntry = Object.entries(ROLES).find(([key, roleId]) =>
+      !['Basic', 'Advanced'].includes(key) && newRoleIds.includes(roleId)
+    );
+    if (!tierEntry) return; // Tidak punya tier role — skip
+
+    const detectedTier = tierEntry[0];
+
+    // Deteksi funded status dari role aktif
+    const fundedEntry = Object.entries(FUNDED_ROLES).find(([, roleId]) =>
+      newRoleIds.includes(roleId)
+    );
+    const detectedFunded = fundedEntry ? fundedEntry[0] : null;
+
+    // Cari member di database berdasarkan discord_id
+    const { data: dbMember } = await supabase
+      .from('members')
+      .select('id, nama, tier, funded_status')
+      .eq('discord_id', newMember.id)
+      .single();
+
+    let namaForNickname;
+
+    if (dbMember) {
+      // Member ditemukan di DB — update data jika ada perubahan
+      const updates = {};
+      if (detectedTier !== dbMember.tier) updates.tier = detectedTier;
+      if (detectedFunded !== dbMember.funded_status) updates.funded_status = detectedFunded;
+      if (Object.keys(updates).length > 0) {
+        await supabase.from('members').update(updates).eq('id', dbMember.id);
+      }
+      namaForNickname = dbMember.nama;
+    } else {
+      // Member belum ada di DB / belum hubungkan Discord
+      // Coba ambil nama dari nickname Discord yang ada
+      const existingNick = newMember.nickname || newMember.user.displayName || newMember.user.username;
+      namaForNickname = extractNameFromNickname(newMember.nickname) || newMember.user.displayName || newMember.user.username;
+      console.log(`guildMemberUpdate: ${newMember.id} tidak ada di DB, pakai nama dari Discord: ${namaForNickname}`);
+    }
+
+    // Format dan set nickname baru
+    const nickname = formatNickname(namaForNickname, detectedTier, detectedFunded);
+    await newMember.setNickname(nickname);
+    console.log(`guildMemberUpdate: ${newMember.id} → ${nickname}`);
+  } catch (err) {
+    console.error('guildMemberUpdate error:', err.message);
+  }
+});
+
+// Endpoint: Bulk update nickname semua member di server berdasarkan role Discord mereka
+app.post('/discord/sync-all-nicknames', async (req, res) => {
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const allMembers = await guild.members.fetch();
+
+    let updated = 0;
+    let skipped = 0;
+
+    for (const [, member] of allMembers) {
+      if (member.user.bot) continue;
+
+      const memberRoleIds = member.roles.cache.map(r => r.id);
+
+      // Cek punya tier role
+      const tierEntry = Object.entries(ROLES).find(([key, roleId]) =>
+        !['Basic', 'Advanced'].includes(key) && memberRoleIds.includes(roleId)
+      );
+      if (!tierEntry) { skipped++; continue; }
+
+      const detectedTier = tierEntry[0];
+      const fundedEntry = Object.entries(FUNDED_ROLES).find(([, roleId]) =>
+        memberRoleIds.includes(roleId)
+      );
+      const detectedFunded = fundedEntry ? fundedEntry[0] : null;
+
+      // Coba cari di database dulu
+      const { data: dbMember } = await supabase
+        .from('members')
+        .select('nama')
+        .eq('discord_id', member.id)
+        .single();
+
+      const nama = dbMember?.nama
+        || extractNameFromNickname(member.nickname)
+        || member.user.displayName
+        || member.user.username;
+
+      const nickname = formatNickname(nama, detectedTier, detectedFunded);
+
+      try {
+        await member.setNickname(nickname);
+        updated++;
+        // Delay 500ms antar member biar tidak kena rate limit Discord
+        await new Promise(r => setTimeout(r, 500));
+      } catch (e) {
+        console.error(`Gagal set nickname ${member.id}:`, e.message);
+        skipped++;
+      }
+    }
+
+    res.json({ success: true, updated, skipped });
+  } catch (err) {
+    console.error('sync-all-nicknames error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 client.login(BOT_TOKEN);
