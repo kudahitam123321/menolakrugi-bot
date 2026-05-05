@@ -28,6 +28,33 @@ const ROLES = {
   'Advanced': '1390888679123189760',
 };
 
+// Funded Role IDs
+const FUNDED_ROLES = {
+  'P1':    '1450143559704510534',
+  'P2':    '1450143702193405952',
+  'Master':'1450143778407977144',
+  'MPAID': '1432673955596210206',
+  'Ap':    '1295584121778868314',
+};
+
+// Tier emoji prefix
+const TIER_EMOJI = {
+  'SMC Platinum 1 on 1': '💎',
+  'SMC Gold Mentorship':  '🥇',
+  'SMC Silver':           '🥈',
+  'SMC Bronze':           '🥉',
+  'SMC Trial':            '🕒',
+};
+
+// Funded suffix
+const FUNDED_SUFFIX = {
+  'P1':    '·P1',
+  'P2':    '·P2',
+  'Master':'·MST',
+  'MPAID': '·MPAID',
+  'Ap':    '·Ap',
+};
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Discord Bot Client
@@ -41,25 +68,32 @@ client.once('ready', () => {
 
 client.login(BOT_TOKEN);
 
-// Helper: format nickname Discord
-function formatNickname(namaLengkap) {
+// Helper: ambil nama panggilan dari nama lengkap
+function getNamaPanggil(namaLengkap) {
   const kata = namaLengkap.trim().split(/\s+/);
   const muhamadVariants = ['muhammad', 'muhamad', 'mohammad', 'mohamad', 'muhammah'];
   let namaPanggil = kata[0];
   if (muhamadVariants.includes(kata[0].toLowerCase()) && kata.length > 1) {
     namaPanggil = kata[1];
   }
-  // Capitalize huruf pertama
-  namaPanggil = namaPanggil.charAt(0).toUpperCase() + namaPanggil.slice(1).toLowerCase();
-  return `[✅] ${namaPanggil}_ᴾᵀᴹᴿ`;
+  return namaPanggil.charAt(0).toUpperCase() + namaPanggil.slice(1).toLowerCase();
+}
+
+// Helper: format nickname Discord
+// tier: tier kelas member, fundedStatus: null atau key dari FUNDED_SUFFIX
+function formatNickname(namaLengkap, tier, fundedStatus = null) {
+  const nama = getNamaPanggil(namaLengkap);
+  const emoji = TIER_EMOJI[tier] || '🕒';
+  const suffix = fundedStatus && FUNDED_SUFFIX[fundedStatus] ? FUNDED_SUFFIX[fundedStatus] : '';
+  return `[${emoji}]${nama}_ᴾᵀᴹᴿ${suffix}`;
 }
 
 // Helper: set nickname member di Discord
-async function setMemberNickname(discordUserId, namaLengkap) {
+async function setMemberNickname(discordUserId, namaLengkap, tier, fundedStatus = null) {
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
     const member = await guild.members.fetch(discordUserId);
-    const nickname = formatNickname(namaLengkap);
+    const nickname = formatNickname(namaLengkap, tier, fundedStatus);
     await member.setNickname(nickname);
     console.log(`Nickname set: ${nickname}`);
     return { success: true, nickname };
@@ -70,12 +104,11 @@ async function setMemberNickname(discordUserId, namaLengkap) {
 }
 
 // Helper: set roles untuk member
-async function setMemberRoles(discordUserId, tier, isAdvance) {
+async function setMemberRoles(discordUserId, tier, isAdvance, fundedStatus = null) {
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
     const member = await guild.members.fetch(discordUserId);
 
-    // Kumpulkan role yang harus diberikan
     const rolesToAdd = [];
 
     // Role tier
@@ -87,15 +120,21 @@ async function setMemberRoles(discordUserId, tier, isAdvance) {
     // Role Advanced hanya kalau sudah approved
     if (isAdvance) rolesToAdd.push(ROLES['Advanced']);
 
-    // Hapus role tier & level lama dulu
-    const tierRoleIds = Object.values(ROLES);
+    // Role funded
+    if (fundedStatus && FUNDED_ROLES[fundedStatus]) {
+      rolesToAdd.push(FUNDED_ROLES[fundedStatus]);
+    }
+
+    // Hapus semua role tier, level, dan funded lama dulu
+    const allManagedRoleIds = [
+      ...Object.values(ROLES),
+      ...Object.values(FUNDED_ROLES),
+    ];
     const currentRoles = member.roles.cache
-      .filter(r => tierRoleIds.includes(r.id))
+      .filter(r => allManagedRoleIds.includes(r.id))
       .map(r => r.id);
 
-    if (currentRoles.length > 0) {
-      await member.roles.remove(currentRoles);
-    }
+    if (currentRoles.length > 0) await member.roles.remove(currentRoles);
 
     // Kasih role baru
     await member.roles.add(rolesToAdd);
@@ -168,10 +207,10 @@ app.get('/discord/callback', async (req, res) => {
     }).eq('id', member_id);
 
     // Set roles
-    const result = await setMemberRoles(discordUser.id, member.tier, member.is_advance);
+    const result = await setMemberRoles(discordUser.id, member.tier, member.is_advance, member.funded_status);
 
     // Auto set nickname
-    await setMemberNickname(discordUser.id, member.nama);
+    await setMemberNickname(discordUser.id, member.nama, member.tier, member.funded_status);
 
     if (result.success) {
       res.json({ success: true, discord_username: discordUser.username, tier: member.tier });
@@ -184,14 +223,13 @@ app.get('/discord/callback', async (req, res) => {
   }
 });
 
-// Endpoint: Sync role (kalau member naik advance)
+// Endpoint: Sync role (kalau member naik advance atau update funded status)
 app.post('/discord/sync', async (req, res) => {
   const { member_id } = req.body;
   const { data: member } = await supabase.from('members').select('*').eq('id', member_id).single();
   if (!member || !member.discord_id) return res.status(404).json({ error: 'Member not found or Discord not connected' });
-  const result = await setMemberRoles(member.discord_id, member.tier, member.is_advance);
-  // Sync nickname juga
-  await setMemberNickname(member.discord_id, member.nama);
+  const result = await setMemberRoles(member.discord_id, member.tier, member.is_advance, member.funded_status);
+  await setMemberNickname(member.discord_id, member.nama, member.tier, member.funded_status);
   res.json(result);
 });
 
@@ -200,8 +238,37 @@ app.post('/discord/nickname', async (req, res) => {
   const { member_id } = req.body;
   const { data: member } = await supabase.from('members').select('*').eq('id', member_id).single();
   if (!member || !member.discord_id) return res.status(404).json({ error: 'Member tidak ditemukan atau Discord belum terhubung' });
-  const result = await setMemberNickname(member.discord_id, member.nama);
+  const result = await setMemberNickname(member.discord_id, member.nama, member.tier, member.funded_status);
   res.json(result);
+});
+
+// Endpoint: Update funded status member → otomatis update nickname & role Discord
+app.post('/discord/funded-status', async (req, res) => {
+  const { member_id, funded_status } = req.body;
+
+  // Validasi funded_status
+  const validStatus = ['P1', 'P2', 'Master', 'MPAID', 'Ap', null];
+  if (!validStatus.includes(funded_status)) {
+    return res.status(400).json({ error: 'funded_status tidak valid' });
+  }
+
+  // Update di database
+  const { error: updateError } = await supabase
+    .from('members')
+    .update({ funded_status })
+    .eq('id', member_id);
+
+  if (updateError) return res.status(500).json({ error: updateError.message });
+
+  // Ambil data member terbaru
+  const { data: member } = await supabase.from('members').select('*').eq('id', member_id).single();
+  if (!member || !member.discord_id) return res.json({ success: true, discord_updated: false });
+
+  // Update nickname & role di Discord
+  await setMemberRoles(member.discord_id, member.tier, member.is_advance, funded_status);
+  const nicknameResult = await setMemberNickname(member.discord_id, member.nama, member.tier, funded_status);
+
+  res.json({ success: true, discord_updated: true, nickname: nicknameResult.nickname });
 });
 
 // Endpoint: Kirim ucapan selamat naik Advanced (1 member)
