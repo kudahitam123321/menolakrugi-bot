@@ -204,6 +204,54 @@ app.post('/discord/nickname', async (req, res) => {
   res.json(result);
 });
 
+// Endpoint: Kirim ucapan selamat naik Advanced (1 member)
+app.post('/discord/congrats-advanced', async (req, res) => {
+  const { discord_id, discord_username, nama, channel_id } = req.body;
+  if (!discord_id || !channel_id) return res.status(400).json({ error: 'discord_id dan channel_id wajib' });
+  try {
+    const channel = await client.channels.fetch(channel_id);
+    if (!channel) return res.status(404).json({ error: 'Channel tidak ditemukan' });
+    const msg = `🏆 **SELAMAT <@${discord_id}> — Resmi Naik ke Kelas Advanced!**\n\nKerja keras dan konsistensimu terbayar. Sekarang tantangan sesungguhnya dimulai.\n\nTetap disiplin, tetap berjurnal, dan terus berkembang! 💪\n\n📜 Sertifikat kelulusan kamu sudah tersedia — login ke **menolakrugi.pages.dev** → menu **Sertifikat** → download sekarang!\n\n— Mentor Menolak Rugi 🏆`;
+    await channel.send(msg);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Congrats error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint: Kirim ucapan selamat ke semua member advanced lama (bulk)
+app.post('/discord/congrats-all-advanced', async (req, res) => {
+  const { channel_id } = req.body;
+  if (!channel_id) return res.status(400).json({ error: 'channel_id wajib' });
+  try {
+    const { data: members } = await supabase
+      .from('members')
+      .select('nama, discord_id, discord_username')
+      .eq('is_advance', true)
+      .not('discord_id', 'is', null);
+    if (!members || members.length === 0) return res.json({ success: true, sent: 0 });
+    const channel = await client.channels.fetch(channel_id);
+    if (!channel) return res.status(404).json({ error: 'Channel tidak ditemukan' });
+    let sent = 0;
+    for (const m of members) {
+      try {
+        const msg = `🏆 **SELAMAT <@${m.discord_id}> — Resmi Naik ke Kelas Advanced!**\n\nKerja keras dan konsistensimu terbayar. Sekarang tantangan sesungguhnya dimulai.\n\nTetap disiplin, tetap berjurnal, dan terus berkembang! 💪\n\n📜 Sertifikat kelulusan kamu sudah tersedia — login ke **menolakrugi.pages.dev** → menu **Sertifikat** → download sekarang!\n\n— Mentor Menolak Rugi 🏆`;
+        await channel.send(msg);
+        sent++;
+        // Delay 1.5 detik antar pesan biar tidak kena rate limit Discord
+        await new Promise(r => setTimeout(r, 1500));
+      } catch (e) {
+        console.error(`Gagal kirim ke ${m.nama}:`, e.message);
+      }
+    }
+    res.json({ success: true, sent, total: members.length });
+  } catch (err) {
+    console.error('Congrats all error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Endpoint: Kirim pengumuman ke channel Discord
 app.post('/discord/announce', async (req, res) => {
   const { channel_id, message } = req.body;
