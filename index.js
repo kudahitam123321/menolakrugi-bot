@@ -35,6 +35,7 @@ const FUNDED_ROLES = {
   'Master':'1450143778407977144',
   'MPAID': '1432673955596210206',
   'Ap':    '1295584121778868314',
+  'DA':    '',  // Demo Account — isi role ID jika ada, kosong = tidak set role
 };
 
 // Tier emoji prefix
@@ -53,6 +54,7 @@ const FUNDED_SUFFIX = {
   'Master':'·MST',
   'MPAID': '·MPAID',
   'Ap':    '·Ap',
+  'DA':    '·DA',
 };
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -348,8 +350,8 @@ async function setMemberRoles(discordUserId, tier, isAdvance, fundedStatus = nul
     // Role Advanced hanya kalau sudah approved
     if (isAdvance) rolesToAdd.push(ROLES['Advanced']);
 
-    // Role funded
-    if (fundedStatus && FUNDED_ROLES[fundedStatus]) {
+    // Role funded (skip jika role ID kosong, misal DA)
+    if (fundedStatus && FUNDED_ROLES[fundedStatus] && FUNDED_ROLES[fundedStatus] !== '') {
       rolesToAdd.push(FUNDED_ROLES[fundedStatus]);
     }
 
@@ -475,7 +477,7 @@ app.post('/discord/funded-status', async (req, res) => {
   const { member_id, funded_status } = req.body;
 
   // Validasi funded_status
-  const validStatus = ['P1', 'P2', 'Master', 'MPAID', 'Ap', null];
+  const validStatus = ['P1', 'P2', 'Master', 'MPAID', 'Ap', 'DA', null];
   if (!validStatus.includes(funded_status)) {
     return res.status(400).json({ error: 'funded_status tidak valid' });
   }
@@ -497,6 +499,45 @@ app.post('/discord/funded-status', async (req, res) => {
   const nicknameResult = await setMemberNickname(member.discord_id, member.nama, member.tier, funded_status);
 
   res.json({ success: true, discord_updated: true, nickname: nicknameResult.nickname });
+});
+
+// Endpoint: Member self-report trading status (dari DashboardPage)
+app.post('/discord/update-trading-status', async (req, res) => {
+  const { member_id, funded_status } = req.body;
+
+  const validStatus = ['P1', 'P2', 'Master', 'MPAID', 'Ap', 'DA', null];
+  if (!validStatus.includes(funded_status)) {
+    return res.status(400).json({ error: 'Status tidak valid' });
+  }
+
+  const { error: updateError } = await supabase
+    .from('members')
+    .update({ funded_status: funded_status || null })
+    .eq('id', member_id);
+
+  if (updateError) return res.status(500).json({ error: updateError.message });
+
+  // Fetch member terbaru
+  const { data: member } = await supabase.from('members').select('*').eq('id', member_id).single();
+  if (!member) return res.status(404).json({ error: 'Member tidak ditemukan' });
+
+  // Kalau Discord belum terhubung → simpan saja, tidak update nickname
+  if (!member.discord_id) {
+    return res.json({ success: true, discord_updated: false, message: 'Status disimpan. Hubungkan Discord untuk update nickname.' });
+  }
+
+  // Update nickname + role Discord
+  await setMemberRoles(member.discord_id, member.tier, member.is_advance, funded_status);
+  const nicknameResult = await setMemberNickname(member.discord_id, member.nama, member.tier, funded_status);
+
+  res.json({
+    success: true,
+    discord_updated: true,
+    nickname: nicknameResult.nickname || null,
+    message: nicknameResult.success
+      ? `Nickname Discord diupdate: ${nicknameResult.nickname}`
+      : 'Status disimpan, tapi nickname gagal diupdate (member mungkin tidak ada di server).'
+  });
 });
 
 // Endpoint: Kirim ucapan selamat naik Advanced (1 member)
