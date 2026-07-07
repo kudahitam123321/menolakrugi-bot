@@ -1,8 +1,14 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
-import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
-import { createClient } from '@supabase/supabase-js';
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, MessageFlags } from 'discord.js';
+import { createClient } from "@supabase/supabase-js";
+import ws from "ws";
+
+const app = express();
+app.use(cors({ origin: '*' }));
+app.use(express.json());
 
 // DIAGNOSTIK SEMENTARA — cek nama env var port yang di-inject Wispbyte
 // (aman: cuma nama variabel + nilai yang mengandung kata "port", bukan rahasia)
@@ -12,10 +18,6 @@ console.log('=== SEMUA NAMA ENV VAR (nilai disembunyikan) ===');
 console.log(Object.keys(process.env).join(', '));
 console.log('=== END DIAGNOSTIK ===');
 
-const app = express();
-app.use(cors({ origin: '*' }));
-app.use(express.json());
-
 // Config
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -23,7 +25,7 @@ const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const GUILD_ID = '1056938665688969318';
-const REDIRECT_URI = process.env.REDIRECT_URI || 'https://menolakrugi.netlify.app/discord-callback';
+const REDIRECT_URI = process.env.REDIRECT_URI || 'https://menolakrugi.pages.dev/discord-callback';
 
 // Role IDs
 const ROLES = {
@@ -43,7 +45,7 @@ const FUNDED_ROLES = {
   'Master':'1450143778407977144',
   'MPAID': '1432673955596210206',
   'Ap':    '1295584121778868314',
-  'DA':    '',  // Demo Account — isi role ID jika ada, kosong = tidak set role
+  'DA':    '',
 };
 
 // Tier emoji prefix
@@ -65,17 +67,18 @@ const FUNDED_SUFFIX = {
   'DA':    '·DA',
 };
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  realtime: { transport: ws },
+});
 
 // Discord Bot Client
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`Bot ready: ${client.user.tag}`);
 
-  // Register slash command /sync-nickname
   const commands = [
     new SlashCommandBuilder()
       .setName('sync-nickname')
@@ -90,6 +93,26 @@ client.once('ready', async () => {
   } catch (err) {
     console.error('Gagal register slash command:', err.message);
   }
+
+  // ── Supabase Discord Queue ──────────────────────────────────────────
+  supabase
+    .channel('discord-queue')
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'discord_messages' }, async (payload) => {
+      const { id, channel_id, message } = payload.new;
+      if (!id || !channel_id || !message) return;
+      try {
+        const channel = await client.channels.fetch(channel_id);
+        await channel.send(message);
+        await supabase.from('discord_messages').update({ status: 'sent' }).eq('id', id);
+        console.log(`Discord queue: pesan terkirim ke channel ${channel_id}`);
+      } catch (err) {
+        await supabase.from('discord_messages').update({ status: 'error', error_msg: err.message }).eq('id', id);
+        console.error('Discord queue error:', err.message);
+      }
+    })
+    .subscribe();
+  console.log('Discord queue listener aktif');
+  // ─────────────────────────────────────────────────────────────────────
 });
 
 // Handler slash command /sync-nickname
@@ -97,16 +120,17 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== 'sync-nickname') return;
 
-  // Hanya owner server atau admin yang bisa jalankan
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
   const member = interaction.member;
   const isAdmin = member.permissions.has('Administrator');
   const isOwner = interaction.guild.ownerId === interaction.user.id;
 
   if (!isAdmin && !isOwner) {
-    return interaction.reply({ content: '❌ Kamu tidak punya izin menjalankan perintah ini.', ephemeral: true });
+    return interaction.editReply('❌ Kamu tidak punya izin menjalankan perintah ini.');
   }
 
-  await interaction.reply({ content: '⏳ Memperbarui nickname semua member... Harap tunggu.', ephemeral: true });
+  await interaction.editReply('⏳ Memperbarui nickname semua member... Harap tunggu.');
 
   try {
     const guild = interaction.guild;
@@ -121,7 +145,6 @@ client.on('interactionCreate', async (interaction) => {
 
       const memberRoleIds = guildMember.roles.cache.map(r => r.id);
 
-      // Cek punya tier role
       const tierEntry = Object.entries(ROLES).find(([key, roleId]) =>
         !['Basic', 'Advanced'].includes(key) && memberRoleIds.includes(roleId)
       );
@@ -133,7 +156,6 @@ client.on('interactionCreate', async (interaction) => {
       );
       const detectedFunded = fundedEntry ? fundedEntry[0] : null;
 
-      // Coba cari nama di database
       const { data: dbMember } = await supabase
         .from('members')
         .select('nama')
@@ -150,7 +172,7 @@ client.on('interactionCreate', async (interaction) => {
       try {
         await guildMember.setNickname(nickname);
         updated++;
-        await new Promise(r => setTimeout(r, 500)); // delay biar tidak kena rate limit
+        await new Promise(r => setTimeout(r, 500));
       } catch {
         errors++;
       }
@@ -168,22 +190,15 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// Helper: ekstrak nama dari nickname Discord yang sudah ada
-// Contoh: "[✅] Erckxml_ᴾᵀᴹᴿ" → "Erckxml"
-// Contoh: "[🥇]Ahmad_ᴾᵀᴹᴿ·P1" → "Ahmad"
 function extractNameFromNickname(nickname) {
   if (!nickname) return null;
-  // Hapus prefix [emoji] atau [✅] dll
   let name = nickname.replace(/^\[.*?\]\s*/, '');
-  // Hapus suffix _ᴾᵀᴹᴿ dan apapun setelahnya
   name = name.split('_ᴾᵀᴹᴿ')[0];
   return name.trim() || null;
 }
 
-// Event: otomatis update nickname ketika role member berubah manual di Discord
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
   try {
-    // Cek apakah ada perubahan role yang relevan
     const oldRoleIds = oldMember.roles.cache.map(r => r.id);
     const newRoleIds = newMember.roles.cache.map(r => r.id);
 
@@ -197,21 +212,18 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
     if (!roleChanged) return;
 
-    // Deteksi tier dari role aktif
     const tierEntry = Object.entries(ROLES).find(([key, roleId]) =>
       !['Basic', 'Advanced'].includes(key) && newRoleIds.includes(roleId)
     );
-    if (!tierEntry) return; // Tidak punya tier role — skip
+    if (!tierEntry) return;
 
     const detectedTier = tierEntry[0];
 
-    // Deteksi funded status dari role aktif
     const fundedEntry = Object.entries(FUNDED_ROLES).find(([, roleId]) =>
       newRoleIds.includes(roleId)
     );
     const detectedFunded = fundedEntry ? fundedEntry[0] : null;
 
-    // Cari member di database berdasarkan discord_id
     const { data: dbMember } = await supabase
       .from('members')
       .select('id, nama, tier, funded_status')
@@ -221,7 +233,6 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     let namaForNickname;
 
     if (dbMember) {
-      // Member ditemukan di DB — update data jika ada perubahan
       const updates = {};
       if (detectedTier !== dbMember.tier) updates.tier = detectedTier;
       if (detectedFunded !== dbMember.funded_status) updates.funded_status = detectedFunded;
@@ -230,14 +241,9 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
       }
       namaForNickname = dbMember.nama;
     } else {
-      // Member belum ada di DB / belum hubungkan Discord
-      // Coba ambil nama dari nickname Discord yang ada
-      const existingNick = newMember.nickname || newMember.user.displayName || newMember.user.username;
       namaForNickname = extractNameFromNickname(newMember.nickname) || newMember.user.displayName || newMember.user.username;
-      console.log(`guildMemberUpdate: ${newMember.id} tidak ada di DB, pakai nama dari Discord: ${namaForNickname}`);
     }
 
-    // Format dan set nickname baru
     const nickname = formatNickname(namaForNickname, detectedTier, detectedFunded);
     await newMember.setNickname(nickname);
     console.log(`guildMemberUpdate: ${newMember.id} → ${nickname}`);
@@ -246,7 +252,6 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   }
 });
 
-// Endpoint: Bulk update nickname semua member di server berdasarkan role Discord mereka
 app.post('/discord/sync-all-nicknames', async (req, res) => {
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
@@ -260,7 +265,6 @@ app.post('/discord/sync-all-nicknames', async (req, res) => {
 
       const memberRoleIds = member.roles.cache.map(r => r.id);
 
-      // Cek punya tier role
       const tierEntry = Object.entries(ROLES).find(([key, roleId]) =>
         !['Basic', 'Advanced'].includes(key) && memberRoleIds.includes(roleId)
       );
@@ -272,7 +276,6 @@ app.post('/discord/sync-all-nicknames', async (req, res) => {
       );
       const detectedFunded = fundedEntry ? fundedEntry[0] : null;
 
-      // Coba cari di database dulu
       const { data: dbMember } = await supabase
         .from('members')
         .select('nama')
@@ -289,7 +292,6 @@ app.post('/discord/sync-all-nicknames', async (req, res) => {
       try {
         await member.setNickname(nickname);
         updated++;
-        // Delay 500ms antar member biar tidak kena rate limit Discord
         await new Promise(r => setTimeout(r, 500));
       } catch (e) {
         console.error(`Gagal set nickname ${member.id}:`, e.message);
@@ -306,7 +308,6 @@ app.post('/discord/sync-all-nicknames', async (req, res) => {
 
 client.login(BOT_TOKEN);
 
-// Helper: ambil nama panggilan dari nama lengkap
 function getNamaPanggil(namaLengkap) {
   const kata = namaLengkap.trim().split(/\s+/);
   const muhamadVariants = ['muhammad', 'muhamad', 'mohammad', 'mohamad', 'muhammah'];
@@ -317,8 +318,6 @@ function getNamaPanggil(namaLengkap) {
   return namaPanggil.charAt(0).toUpperCase() + namaPanggil.slice(1).toLowerCase();
 }
 
-// Helper: format nickname Discord
-// tier: tier kelas member, fundedStatus: null atau key dari FUNDED_SUFFIX
 function formatNickname(namaLengkap, tier, fundedStatus = null) {
   const nama = getNamaPanggil(namaLengkap);
   const emoji = TIER_EMOJI[tier] || '🕒';
@@ -326,7 +325,6 @@ function formatNickname(namaLengkap, tier, fundedStatus = null) {
   return `[${emoji}]${nama}_ᴾᵀᴹᴿ${suffix}`;
 }
 
-// Helper: set nickname member di Discord
 async function setMemberNickname(discordUserId, namaLengkap, tier, fundedStatus = null) {
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
@@ -341,29 +339,19 @@ async function setMemberNickname(discordUserId, namaLengkap, tier, fundedStatus 
   }
 }
 
-// Helper: set roles untuk member
 async function setMemberRoles(discordUserId, tier, isAdvance, fundedStatus = null) {
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
     const member = await guild.members.fetch(discordUserId);
 
     const rolesToAdd = [];
-
-    // Role tier
     if (ROLES[tier]) rolesToAdd.push(ROLES[tier]);
-
-    // Role Basic selalu diberikan
     rolesToAdd.push(ROLES['Basic']);
-
-    // Role Advanced hanya kalau sudah approved
     if (isAdvance) rolesToAdd.push(ROLES['Advanced']);
-
-    // Role funded (skip jika role ID kosong, misal DA)
     if (fundedStatus && FUNDED_ROLES[fundedStatus] && FUNDED_ROLES[fundedStatus] !== '') {
       rolesToAdd.push(FUNDED_ROLES[fundedStatus]);
     }
 
-    // Hapus semua role tier, level, dan funded lama dulu
     const allManagedRoleIds = [
       ...Object.values(ROLES),
       ...Object.values(FUNDED_ROLES),
@@ -373,8 +361,6 @@ async function setMemberRoles(discordUserId, tier, isAdvance, fundedStatus = nul
       .map(r => r.id);
 
     if (currentRoles.length > 0) await member.roles.remove(currentRoles);
-
-    // Kasih role baru
     await member.roles.add(rolesToAdd);
 
     return { success: true };
@@ -384,16 +370,11 @@ async function setMemberRoles(discordUserId, tier, isAdvance, fundedStatus = nul
   }
 }
 
-// Endpoint: OAuth2 callback - terima code dari Discord
 app.get('/discord/callback', async (req, res) => {
   const { code, member_id } = req.query;
-
-  if (!code || !member_id) {
-    return res.status(400).json({ error: 'Missing code or member_id' });
-  }
+  if (!code || !member_id) return res.status(400).json({ error: 'Missing code or member_id' });
 
   try {
-    // Tukar code dengan access token
     const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -408,27 +389,23 @@ app.get('/discord/callback', async (req, res) => {
 
     const tokenData = await tokenRes.json();
     if (!tokenData.access_token) {
-      return res.status(400).json({ error: 'Invalid code' });
+      console.log('DEBUG token exchange gagal:', tokenRes.status, tokenData);
+      return res.status(400).json({ error: 'Invalid code', debug_status: tokenRes.status, debug_discord: tokenData });
     }
 
-    // Ambil info user Discord
     const userRes = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
     const discordUser = await userRes.json();
 
-    // Cek member di database
     const { data: member, error: memberError } = await supabase
       .from('members')
       .select('*')
       .eq('id', member_id)
       .single();
 
-    if (memberError || !member) {
-      return res.status(404).json({ error: 'Member not found' });
-    }
+    if (memberError || !member) return res.status(404).json({ error: 'Member not found' });
 
-    // Join server dulu (kalau belum)
     await fetch(`https://discord.com/api/guilds/${GUILD_ID}/members/${discordUser.id}`, {
       method: 'PUT',
       headers: {
@@ -438,16 +415,12 @@ app.get('/discord/callback', async (req, res) => {
       body: JSON.stringify({ access_token: tokenData.access_token }),
     });
 
-    // Simpan Discord ID ke database
     await supabase.from('members').update({
       discord_id: discordUser.id,
       discord_username: discordUser.username,
     }).eq('id', member_id);
 
-    // Set roles
     const result = await setMemberRoles(discordUser.id, member.tier, member.is_advance, member.funded_status);
-
-    // Auto set nickname
     await setMemberNickname(discordUser.id, member.nama, member.tier, member.funded_status);
 
     if (result.success) {
@@ -461,7 +434,6 @@ app.get('/discord/callback', async (req, res) => {
   }
 });
 
-// Endpoint: Sync role (kalau member naik advance atau update funded status)
 app.post('/discord/sync', async (req, res) => {
   const { member_id } = req.body;
   const { data: member } = await supabase.from('members').select('*').eq('id', member_id).single();
@@ -471,7 +443,6 @@ app.post('/discord/sync', async (req, res) => {
   res.json(result);
 });
 
-// Endpoint: Set nickname manual
 app.post('/discord/nickname', async (req, res) => {
   const { member_id } = req.body;
   const { data: member } = await supabase.from('members').select('*').eq('id', member_id).single();
@@ -480,75 +451,49 @@ app.post('/discord/nickname', async (req, res) => {
   res.json(result);
 });
 
-// Endpoint: Update funded status member → otomatis update nickname & role Discord
 app.post('/discord/funded-status', async (req, res) => {
   const { member_id, funded_status } = req.body;
-
-  // Validasi funded_status
   const validStatus = ['P1', 'P2', 'Master', 'MPAID', 'Ap', 'DA', null];
-  if (!validStatus.includes(funded_status)) {
-    return res.status(400).json({ error: 'funded_status tidak valid' });
-  }
+  if (!validStatus.includes(funded_status)) return res.status(400).json({ error: 'funded_status tidak valid' });
 
-  // Update di database
-  const { error: updateError } = await supabase
-    .from('members')
-    .update({ funded_status })
-    .eq('id', member_id);
-
+  const { error: updateError } = await supabase.from('members').update({ funded_status }).eq('id', member_id);
   if (updateError) return res.status(500).json({ error: updateError.message });
 
-  // Ambil data member terbaru
   const { data: member } = await supabase.from('members').select('*').eq('id', member_id).single();
   if (!member || !member.discord_id) return res.json({ success: true, discord_updated: false });
 
-  // Update nickname & role di Discord
   await setMemberRoles(member.discord_id, member.tier, member.is_advance, funded_status);
   const nicknameResult = await setMemberNickname(member.discord_id, member.nama, member.tier, funded_status);
-
   res.json({ success: true, discord_updated: true, nickname: nicknameResult.nickname });
 });
 
-// Endpoint: Member self-report trading status (dari DashboardPage)
 app.post('/discord/update-trading-status', async (req, res) => {
   const { member_id, funded_status } = req.body;
-
   const validStatus = ['P1', 'P2', 'Master', 'MPAID', 'Ap', 'DA', null];
-  if (!validStatus.includes(funded_status)) {
-    return res.status(400).json({ error: 'Status tidak valid' });
-  }
+  if (!validStatus.includes(funded_status)) return res.status(400).json({ error: 'Status tidak valid' });
 
-  const { error: updateError } = await supabase
-    .from('members')
-    .update({ funded_status: funded_status || null })
-    .eq('id', member_id);
-
+  const { error: updateError } = await supabase.from('members').update({ funded_status: funded_status || null }).eq('id', member_id);
   if (updateError) return res.status(500).json({ error: updateError.message });
 
-  // Fetch member terbaru
   const { data: member } = await supabase.from('members').select('*').eq('id', member_id).single();
   if (!member) return res.status(404).json({ error: 'Member tidak ditemukan' });
 
-  // Kalau Discord belum terhubung → simpan saja, tidak update nickname
   if (!member.discord_id) {
     return res.json({ success: true, discord_updated: false, message: 'Status disimpan. Hubungkan Discord untuk update nickname.' });
   }
 
-  // Update nickname + role Discord
   await setMemberRoles(member.discord_id, member.tier, member.is_advance, funded_status);
   const nicknameResult = await setMemberNickname(member.discord_id, member.nama, member.tier, funded_status);
-
   res.json({
     success: true,
     discord_updated: true,
     nickname: nicknameResult.nickname || null,
     message: nicknameResult.success
       ? `Nickname Discord diupdate: ${nicknameResult.nickname}`
-      : 'Status disimpan, tapi nickname gagal diupdate (member mungkin tidak ada di server).'
+      : 'Status disimpan, tapi nickname gagal diupdate.',
   });
 });
 
-// Endpoint: Kirim ucapan selamat naik Advanced (1 member)
 app.post('/discord/congrats-advanced', async (req, res) => {
   const { discord_id, discord_username, nama, channel_id } = req.body;
   if (!discord_id || !channel_id) return res.status(400).json({ error: 'discord_id dan channel_id wajib' });
@@ -564,7 +509,6 @@ app.post('/discord/congrats-advanced', async (req, res) => {
   }
 });
 
-// Endpoint: Kirim ucapan selamat ke semua member advanced lama (bulk)
 app.post('/discord/congrats-all-advanced', async (req, res) => {
   const { channel_id } = req.body;
   if (!channel_id) return res.status(400).json({ error: 'channel_id wajib' });
@@ -583,7 +527,6 @@ app.post('/discord/congrats-all-advanced', async (req, res) => {
         const msg = `🏆 **SELAMAT <@${m.discord_id}> — Resmi Naik ke Kelas Advanced!**\n\nKerja keras dan konsistensimu terbayar. Sekarang tantangan sesungguhnya dimulai.\n\nTetap disiplin, tetap berjurnal, dan terus berkembang! 💪\n\n📜 Sertifikat kelulusan kamu sudah tersedia — login ke **menolakrugi.pages.dev** → menu **Sertifikat** → download sekarang!\n\n— Mentor Menolak Rugi 🏆`;
         await channel.send(msg);
         sent++;
-        // Delay 1.5 detik antar pesan biar tidak kena rate limit Discord
         await new Promise(r => setTimeout(r, 1500));
       } catch (e) {
         console.error(`Gagal kirim ke ${m.nama}:`, e.message);
@@ -596,12 +539,9 @@ app.post('/discord/congrats-all-advanced', async (req, res) => {
   }
 });
 
-// Endpoint: Kirim pengumuman ke channel Discord
 app.post('/discord/announce', async (req, res) => {
   const { channel_id, message } = req.body;
-  if (!channel_id || !message) {
-    return res.status(400).json({ error: 'channel_id dan message wajib diisi' });
-  }
+  if (!channel_id || !message) return res.status(400).json({ error: 'channel_id dan message wajib diisi' });
   try {
     const channel = await client.channels.fetch(channel_id);
     if (!channel) return res.status(404).json({ error: 'Channel tidak ditemukan' });
@@ -614,13 +554,12 @@ app.post('/discord/announce', async (req, res) => {
 });
 
 // Health check
-app.get('/', (req, res) => res.json({ status: 'MenolakRugi Bot is running!' }));
+app.get('/', (req, res) => res.json({ status: 'MenolakRugi Bot is running! 🤖' }));
 
 // ─── Session Scheduler ───────────────────────────────────────────────
 const SESSION_CHANNEL = '1390897671874674728';
 
 const SESSION_MESSAGES = {
-  // Format: 'HH:MM' dalam WITA (UTC+8)
   '07:00': {
     msg: `🌸 **SESSION TOKYO DIBUKA**\n\nSesi Asia resmi dimulai! Likuiditas mulai meningkat.\n\n📊 Pair yang aktif: **USD/JPY, EUR/JPY, GBP/JPY**\n\n> Perhatikan level-level penting dari sesi sebelumnya. Setup IDM dan OB sering terbentuk di sini! 🎯`,
   },
@@ -643,7 +582,6 @@ const SESSION_MESSAGES = {
 
 function getWITATime() {
   const now = new Date();
-  // UTC+8
   const wita = new Date(now.getTime() + 8 * 60 * 60 * 1000);
   const hh = String(wita.getUTCHours()).padStart(2, '0');
   const mm = String(wita.getUTCMinutes()).padStart(2, '0');
@@ -659,7 +597,6 @@ async function sendSessionMessage(msg) {
   }
 }
 
-// Cek setiap menit
 let lastSent = '';
 setInterval(async () => {
   const time = getWITATime();
