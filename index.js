@@ -10,14 +10,6 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// DIAGNOSTIK SEMENTARA — cek nama env var port yang di-inject Wispbyte
-// (aman: cuma nama variabel + nilai yang mengandung kata "port", bukan rahasia)
-console.log('=== ENV VARS mengandung "port" ===');
-Object.keys(process.env).filter(k => /port/i.test(k)).forEach(k => console.log(`${k} = ${process.env[k]}`));
-console.log('=== SEMUA NAMA ENV VAR (nilai disembunyikan) ===');
-console.log(Object.keys(process.env).join(', '));
-console.log('=== END DIAGNOSTIK ===');
-
 // Config
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -25,7 +17,7 @@ const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const GUILD_ID = '1056938665688969318';
-const REDIRECT_URI = process.env.REDIRECT_URI || 'https://menolakrugi.pages.dev/discord-callback';
+const REDIRECT_URI = process.env.REDIRECT_URI || 'https://menolakrugi.com/discord-callback';
 
 // Role IDs
 const ROLES = {
@@ -388,10 +380,7 @@ app.get('/discord/callback', async (req, res) => {
     });
 
     const tokenData = await tokenRes.json();
-    if (!tokenData.access_token) {
-      console.log('DEBUG token exchange gagal:', tokenRes.status, tokenData);
-      return res.status(400).json({ error: 'Invalid code', debug_status: tokenRes.status, debug_discord: tokenData });
-    }
+    if (!tokenData.access_token) return res.status(400).json({ error: 'Invalid code' });
 
     const userRes = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
