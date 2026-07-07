@@ -4,6 +4,14 @@ import fetch from 'node-fetch';
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
 import { createClient } from '@supabase/supabase-js';
 
+// DIAGNOSTIK SEMENTARA — cek nama env var port yang di-inject Wispbyte
+// (aman: cuma nama variabel + nilai yang mengandung kata "port", bukan rahasia)
+console.log('=== ENV VARS mengandung "port" ===');
+Object.keys(process.env).filter(k => /port/i.test(k)).forEach(k => console.log(`${k} = ${process.env[k]}`));
+console.log('=== SEMUA NAMA ENV VAR (nilai disembunyikan) ===');
+console.log(Object.keys(process.env).join(', '));
+console.log('=== END DIAGNOSTIK ===');
+
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
