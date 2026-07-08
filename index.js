@@ -40,6 +40,23 @@ const FUNDED_ROLES = {
   'DA':    '',
 };
 
+// Indicator subscription role IDs — independent from ROLES/FUNDED_ROLES above
+const INDICATOR_ROLES = {
+  bulanan:  '1523561374838689792',
+  tahunan:  '1524314446133072084',
+  lifetime: '1519657058608218293',
+};
+
+function jatuhTempoLewat(activatedAt, planType) {
+  if (planType === 'lifetime') return false;
+  if (!activatedAt) return true;
+  const d = new Date(activatedAt);
+  if (planType === 'bulanan') d.setMonth(d.getMonth() + 1);
+  else if (planType === 'tahunan') d.setFullYear(d.getFullYear() + 1);
+  else return true;
+  return d < new Date();
+}
+
 // Tier emoji prefix
 const TIER_EMOJI = {
   'SMC Platinum 1 on 1': '💎',
@@ -362,6 +379,40 @@ async function setMemberRoles(discordUserId, tier, isAdvance, fundedStatus = nul
   }
 }
 
+async function syncIndicatorRole(memberId) {
+  try {
+    const { data: member } = await supabase.from('members').select('id, discord_id').eq('id', memberId).single();
+    if (!member || !member.discord_id) return { success: false, error: 'Member not found or Discord not connected' };
+
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('plan_type, status, activated_at')
+      .eq('member_id', memberId)
+      .in('plan_type', ['bulanan', 'tahunan', 'lifetime'])
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    const latest = orders && orders[0];
+    const shouldHaveRole = !!latest && latest.status === 'aktif' && !jatuhTempoLewat(latest.activated_at, latest.plan_type);
+    const targetRoleId = shouldHaveRole ? INDICATOR_ROLES[latest.plan_type] : null;
+
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const guildMember = await guild.members.fetch(member.discord_id);
+
+    const currentIndicatorRoles = guildMember.roles.cache
+      .filter(r => Object.values(INDICATOR_ROLES).includes(r.id))
+      .map(r => r.id);
+    const toRemove = currentIndicatorRoles.filter(id => id !== targetRoleId);
+    if (toRemove.length > 0) await guildMember.roles.remove(toRemove);
+    if (targetRoleId && !currentIndicatorRoles.includes(targetRoleId)) await guildMember.roles.add(targetRoleId);
+
+    return { success: true, role_assigned: targetRoleId };
+  } catch (err) {
+    console.error('Error sync indicator role:', err.message);
+    return { success: false, error: err.message };
+  }
+}
+
 app.get('/discord/callback', async (req, res) => {
   const { code, member_id } = req.query;
   if (!code || !member_id) return res.status(400).json({ error: 'Missing code or member_id' });
@@ -411,6 +462,7 @@ app.get('/discord/callback', async (req, res) => {
 
     const result = await setMemberRoles(discordUser.id, member.tier, member.is_advance, member.funded_status);
     await setMemberNickname(discordUser.id, member.nama, member.tier, member.funded_status);
+    await syncIndicatorRole(member_id);
 
     if (result.success) {
       res.json({ success: true, discord_username: discordUser.username, tier: member.tier });
@@ -429,6 +481,13 @@ app.post('/discord/sync', async (req, res) => {
   if (!member || !member.discord_id) return res.status(404).json({ error: 'Member not found or Discord not connected' });
   const result = await setMemberRoles(member.discord_id, member.tier, member.is_advance, member.funded_status);
   await setMemberNickname(member.discord_id, member.nama, member.tier, member.funded_status);
+  res.json(result);
+});
+
+app.post('/discord/sync-indicator', async (req, res) => {
+  const { member_id } = req.body;
+  if (!member_id) return res.status(400).json({ error: 'member_id wajib' });
+  const result = await syncIndicatorRole(member_id);
   res.json(result);
 });
 
@@ -597,6 +656,34 @@ setInterval(async () => {
 }, 60 * 1000);
 
 console.log('Session scheduler aktif (WITA/UTC+8)');
+// ─────────────────────────────────────────────────────────────────────
+
+// ── Indicator Role Daily Sync ───────────────────────────────────────
+setInterval(async () => {
+  try {
+    const { data: orderRows } = await supabase
+      .from('orders')
+      .select('member_id')
+      .in('plan_type', ['bulanan', 'tahunan', 'lifetime']);
+    const memberIds = [...new Set((orderRows || []).map(r => r.member_id).filter(Boolean))];
+    if (memberIds.length === 0) return;
+
+    const { data: memberRows } = await supabase
+      .from('members')
+      .select('id')
+      .in('id', memberIds)
+      .not('discord_id', 'is', null);
+
+    for (const m of memberRows || []) {
+      await syncIndicatorRole(m.id);
+    }
+    console.log(`Indicator role sync berkala selesai: ${(memberRows || []).length} member dicek`);
+  } catch (err) {
+    console.error('Indicator role sync berkala error:', err.message);
+  }
+}, 24 * 60 * 60 * 1000);
+
+console.log('Indicator role sync berkala aktif (tiap 24 jam)');
 // ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.SERVER_PORT || process.env.PORT || 8080;
